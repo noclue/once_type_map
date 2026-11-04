@@ -1,0 +1,13 @@
+[package]
+name = "once_type_map"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+authors = ["Kiril Karaatanasov <karaatanasov@gmail.com>"]
+license = "Apache-2.0"
+description = "Thread-safe, insert-once type map that hands out plain references (no guards), like a OnceLock keyed by type"
+readme = "README.md"
+keywords = ["typemap", "extensions", "oncelock", "lazy", "any"]
+categories = ["concurrency", "data-structures", "rust-patterns"]
+
+[dependencies]
