@@ -102,7 +102,7 @@ and `clear()` free empty slots too.
   underlying type.
 - Values must be `Send + Sync + 'static`.
 - Initializers are synchronous and can't fail. If you need fallible or async
-  initialization, store an `OnceLock`-like cell of your own (for example
+  initialization, store a `OnceLock`-like cell of your own (for example
   `tokio::sync::OnceCell`) as the value.
 - A lookup takes a shared read lock. Because the returned reference isn't tied
   to a guard, hot paths can look a value up once and keep the `&T`.
@@ -112,7 +112,7 @@ and `clear()` free empty slots too.
 All `unsafe` code goes through one private `unsafe fn`, `detach`. It extends a
 slot reference from the lock guard's lifetime to the borrow of the map. There
 are three `unsafe` blocks: the one in the body of `detach`, and one at each of
-its two call sites (`slot` and `slot_or_create`). Each call site has to meet
+its two call sites (`slot` and `create_slot`). Each call site has to meet
 `detach`'s precondition: the slot must be owned by the map. Any new call to
 `detach` needs the same review. The test suite includes a test that keeps a
 reference alive while the map grows. Run it under

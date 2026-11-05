@@ -150,6 +150,15 @@
 //! [`is_empty`] scan empty slots along with full ones. [`remove::<T>`] and
 //! [`clear`] free empty slots too.
 //!
+//! # Limitations
+//!
+//! - One value per type. Use newtypes to store several values of the same
+//!   underlying type.
+//! - Initializers are synchronous and can't fail. For fallible or async
+//!   initialization, store a cell of your own as the value, for example
+//!   `tokio::sync::OnceCell<T>`, or `OnceLock<Result<T, E>>` if a failure
+//!   should be cached.
+//!
 //! # Cost
 //!
 //! A lookup takes a shared read lock and does one hash map probe keyed by
@@ -370,6 +379,18 @@ impl OnceTypeMap {
         if let Some(slot) = self.slot::<T>() {
             return slot;
         }
+        self.create_slot::<T>()
+    }
+
+    /// The write-locked half of [`slot_or_create`](Self::slot_or_create).
+    /// Another thread may have created the slot after our read-locked
+    /// lookup missed, so the entry may already be occupied, and that slot's
+    /// value may be borrowed. `or_insert_with` then hands out a `&mut` to the
+    /// `Box` pointer stored in the map, but not to the `OnceLock` it points
+    /// to, so outstanding `&T`s stay valid. The
+    /// `create_slot_on_occupied_entry_keeps_references_valid` test checks
+    /// this under Miri.
+    fn create_slot<T: Send + Sync + 'static>(&self) -> &OnceLock<T> {
         let mut slots = self.write();
         let slot = slots
             .entry(TypeId::of::<T>())
@@ -461,6 +482,10 @@ impl<T: Send + Sync + 'static> Slot for OnceLock<T> {
 
 /// `TypeId` is already a hash, so it is passed through instead of being
 /// hashed again with SipHash.
+///
+/// `TypeId` stores 128 bits, but its `Hash` impl feeds only the low 64 bits
+/// to `write_u64`, so `write_u128` is not needed. `write` is a fallback in
+/// case that changes; the `type_id_hashes_through_write_u64` test catches it.
 #[derive(Default)]
 struct TypeIdHasher(u64);
 
@@ -626,6 +651,53 @@ mod tests {
         assert!(std::ptr::eq(map.get::<String>().unwrap(), address));
     }
 
+    /// The race in `slot_or_create`, made deterministic: the read-locked
+    /// lookup misses, another caller then creates and fills the slot and
+    /// keeps a `&T`, and only then does this caller take the write lock and
+    /// find the entry occupied.
+    #[test]
+    fn create_slot_on_occupied_entry_keeps_references_valid() {
+        let map = OnceTypeMap::new();
+        let held: &String = map.get_or_init(|| "held".to_string());
+
+        let again = map.create_slot::<String>();
+        assert_eq!(held, "held");
+        assert!(std::ptr::eq(again.get().unwrap(), held));
+
+        map.create_slot::<String>().get_or_init(|| unreachable!());
+        assert_eq!(held, "held");
+    }
+
+    #[test]
+    fn zero_sized_values() {
+        let mut map = OnceTypeMap::new();
+        fill!(map, 0 1);
+        assert!(map.get::<Marker<0>>().is_some());
+        assert!(map.get_mut::<Marker<1>>().is_some());
+        assert!(map.remove::<Marker<0>>().is_some());
+        assert!(map.get::<Marker<0>>().is_none());
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn type_id_hashes_through_write_u64() {
+        use std::hash::Hash;
+
+        #[derive(Default)]
+        struct OnlyWriteU64;
+        impl Hasher for OnlyWriteU64 {
+            fn write(&mut self, _: &[u8]) {
+                panic!("TypeId no longer hashes through write_u64");
+            }
+            fn write_u64(&mut self, _: u64) {}
+            fn finish(&self) -> u64 {
+                0
+            }
+        }
+
+        TypeId::of::<String>().hash(&mut OnlyWriteU64);
+    }
+
     #[test]
     fn get_mut_remove_and_clear() {
         let mut map = OnceTypeMap::new();
@@ -673,6 +745,34 @@ mod tests {
         assert_eq!(map.get::<i32>(), Some(&1));
         assert_eq!(*map.get_or_init(|| 2u8), 2);
         assert_eq!(map.len(), 2);
+
+        let mut map = map;
+        *map.get_mut::<i32>().unwrap() += 1;
+        assert_eq!(map.remove::<i32>(), Some(2));
+        map.clear();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn waiter_initializes_after_concurrent_initializer_panics() {
+        let map = OnceTypeMap::new();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+
+        thread::scope(|s| {
+            let panicking = s.spawn(|| {
+                map.get_or_init::<u32>(|| {
+                    started_tx.send(()).unwrap();
+                    thread::sleep(Duration::from_millis(50));
+                    panic!("init failed");
+                });
+            });
+            // Wait until the first initializer is running, so this call
+            // blocks on it rather than winning the race.
+            started_rx.recv().unwrap();
+            assert_eq!(*map.get_or_init(|| 7u32), 7);
+            assert!(panicking.join().is_err());
+        });
+        assert_eq!(map.get::<u32>(), Some(&7));
     }
 
     #[test]
