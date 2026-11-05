@@ -53,25 +53,48 @@ The same reasoning is why `OnceLock` itself can offer `get_mut` and `take`.
 | Method | Receiver | Behavior |
 | --- | --- | --- |
 | `get::<T>()` | `&self` | `Some(&T)` if set |
-| `get_or_init(f)` | `&self` | Returns the value, running `f` exactly once per type if unset |
+| `get_or_init(f)` | `&self` | Returns the value, running `f` first if it is unset |
 | `insert(value)` | `&self` | `Ok(&T)` if it was unset, otherwise gives the value back in `Err` |
 | `contains::<T>()` | `&self` | Whether a value is set |
 | `len()` / `is_empty()` | `&self` | Number of types whose value is set |
 | `get_mut::<T>()` | `&mut self` | `Some(&mut T)` if set |
 | `remove::<T>()` | `&mut self` | Takes the value out; the type can be set again |
-| `clear()` | `&mut self` | Removes all values |
+| `clear()` | `&mut self` | Removes all values and frees all slots |
 
 ## Initialization semantics
 
 - `get_or_init` runs the initializer outside the map's lock. A slow
   initializer for one type doesn't block other types, and an initializer may
-  use the map for other types.
-- For a given type, the initializer runs exactly once, even when many threads
-  race. The other threads block until the value is ready.
-- If the initializer panics, the value stays unset and the next call retries.
-- Calling `get_or_init::<T>` from inside the initializer for the same `T` is a
-  reentrant `OnceLock` initialization. The standard library leaves the outcome
-  unspecified, and today it deadlocks.
+  use the map for other types, as long as initializers don't depend on each
+  other in a cycle (see below).
+- When many threads race to initialize the same type, only one initializer
+  runs. The other threads block until the value is ready. Once an initializer
+  returns, no other initializer for that type runs until the value is removed.
+- If the initializer panics, the value stays unset and the next call runs its
+  own initializer. So an initializer can run more than once over the life of
+  the map: after a panic, and after `remove` or `clear`.
+
+### Deadlocks
+
+Neither of these cases panics or returns an error. They hang:
+
+- Calling `get_or_init::<T>` or `insert::<T>` from inside the initializer for
+  the same `T`. This is a reentrant `OnceLock` initialization. The standard
+  library leaves the outcome unspecified, and today it deadlocks. `insert`
+  doesn't return `Err` here.
+- Initializers that depend on each other in a cycle. If `A`'s initializer
+  uses `B` and `B`'s uses `A`, a single thread hits the reentrant case above.
+  With two threads, one starting with `A` and the other with `B`, each blocks
+  forever waiting for the other's slot.
+
+### Empty slots
+
+A type's slot is created the first time `get_or_init` or `insert` is called
+for it. If the initializer panics, the empty slot stays in the map. Nothing
+called through `&self` removes it, though a later successful initialization
+reuses it. This costs at most one small allocation per distinct type, but
+`len()` and `is_empty()` scan empty slots along with full ones. `remove::<T>()`
+and `clear()` free empty slots too.
 
 ## Caveats
 
@@ -86,9 +109,13 @@ The same reasoning is why `OnceLock` itself can offer `get_mut` and `take`.
 
 ## Checking the unsafe code
 
-The crate has one `unsafe` block, which extends a slot reference from the lock
-guard's lifetime to the borrow of the map. The test suite includes a test that
-keeps a reference alive while the map grows. Run it under
+All `unsafe` code goes through one private `unsafe fn`, `detach`. It extends a
+slot reference from the lock guard's lifetime to the borrow of the map. There
+are three `unsafe` blocks: the one in the body of `detach`, and one at each of
+its two call sites (`slot` and `slot_or_create`). Each call site has to meet
+`detach`'s precondition: the slot must be owned by the map. Any new call to
+`detach` needs the same review. The test suite includes a test that keeps a
+reference alive while the map grows. Run it under
 [Miri](https://github.com/rust-lang/miri) with both aliasing models:
 
 ```sh

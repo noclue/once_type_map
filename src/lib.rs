@@ -112,14 +112,43 @@
 //!
 //! [`get_or_init`] runs the initializer outside the map's lock, so a slow
 //! initializer for one type does not block other types, and an initializer may
-//! itself use the map for *other* types. For a given type the initializer runs
-//! exactly once, even when many threads race: the others block until the
-//! value is ready. If the initializer panics, the slot stays empty and the
-//! next call tries again.
+//! itself use the map for *other* types.
 //!
-//! Calling `get_or_init::<T>` from inside the initializer for the same `T` is
-//! a reentrant `OnceLock` initialization; the outcome is unspecified by the
-//! standard library and is currently a deadlock.
+//! When many threads race to initialize the same type, only one initializer
+//! runs; the others block until the value is ready, then return it. Once an
+//! initializer returns, no other initializer for that type runs until the
+//! value is removed. If the initializer panics, the slot stays empty and the
+//! next call runs its own initializer. So an initializer can run more than
+//! once over the life of the map: after a panic, and after [`remove`] or
+//! [`clear`].
+//!
+//! ## Deadlocks
+//!
+//! Calling [`get_or_init::<T>`](OnceTypeMap::get_or_init) or
+//! [`insert::<T>`](OnceTypeMap::insert) from inside the initializer for the
+//! same `T` is a reentrant `OnceLock` initialization. The standard library
+//! leaves the outcome unspecified, and today it deadlocks.
+//!
+//! Initializers that depend on each other in a cycle deadlock too. If the
+//! initializer for `A` uses `B` and the initializer for `B` uses `A`, then:
+//!
+//! - on one thread, initializing `A` initializes `B`, which re-enters `A`'s
+//!   initialization (the reentrant case above);
+//! - on two threads, one starting with `A` and the other with `B`, each thread
+//!   blocks forever waiting for the slot the other is initializing.
+//!
+//! Neither case panics or reports an error. Keep the dependencies between
+//! initializers acyclic.
+//!
+//! ## Empty slots
+//!
+//! The map creates a type's slot the first time [`get_or_init`] or
+//! [`insert`] is called for it, before the value exists. If the initializer
+//! panics, the empty slot stays in the map. Nothing called through `&self`
+//! removes it, though a later successful initialization reuses it. This costs
+//! at most one small allocation per distinct type, but [`len`] and
+//! [`is_empty`] scan empty slots along with full ones. [`remove::<T>`] and
+//! [`clear`] free empty slots too.
 //!
 //! # Cost
 //!
@@ -128,8 +157,12 @@
 //! hot paths can look a value up once and keep the `&T`.
 //!
 //! [`get_or_init`]: OnceTypeMap::get_or_init
+//! [`insert`]: OnceTypeMap::insert
+//! [`len`]: OnceTypeMap::len
+//! [`is_empty`]: OnceTypeMap::is_empty
 //! [`get_mut`]: OnceTypeMap::get_mut
 //! [`remove`]: OnceTypeMap::remove
+//! [`remove::<T>`]: OnceTypeMap::remove
 //! [`clear`]: OnceTypeMap::clear
 
 use std::{
@@ -196,10 +229,16 @@ impl OnceTypeMap {
     /// Returns the value of type `T`, initializing it with `init` if it has
     /// not been set.
     ///
-    /// `init` runs at most once per type, even when called concurrently from
-    /// many threads; the other callers block until the value is ready. If
-    /// `init` panics, the panic propagates, the value stays unset and a later
-    /// call runs its own initializer.
+    /// When called concurrently from many threads, only one initializer runs;
+    /// the other callers block until the value is ready. Once an initializer
+    /// returns, no other initializer for `T` runs until the value is removed
+    /// with [`remove`](Self::remove) or [`clear`](Self::clear). If `init`
+    /// panics, the panic propagates, the value stays unset and a later call
+    /// runs its own initializer.
+    ///
+    /// Calling `get_or_init::<T>` or [`insert::<T>`](Self::insert) from
+    /// inside `init` deadlocks, and so do initializers that depend on each
+    /// other in a cycle. See [Deadlocks](crate#deadlocks).
     ///
     /// # Examples
     ///
@@ -221,6 +260,9 @@ impl OnceTypeMap {
     /// `Err` if a value of type `T` is already present. If another thread is
     /// initializing `T`, this waits for it to finish.
     ///
+    /// Calling `insert::<T>` from inside an initializer for the same `T`
+    /// deadlocks instead of returning `Err`. See [Deadlocks](crate#deadlocks).
+    ///
     /// # Examples
     ///
     /// ```rust
@@ -232,14 +274,11 @@ impl OnceTypeMap {
     /// assert_eq!(map.get::<u32>(), Some(&1));
     /// ```
     pub fn insert<T: Send + Sync + 'static>(&self, value: T) -> Result<&T, T> {
-        let mut value = Some(value);
-        let stored = self
-            .slot_or_create::<T>()
-            .get_or_init(|| value.take().expect("initializer runs at most once"));
-        match value {
-            None => Ok(stored),
-            Some(value) => Err(value),
-        }
+        let slot = self.slot_or_create::<T>();
+        slot.set(value)?;
+        // Only `&mut self` can empty the slot, so the value set above is
+        // still there.
+        Ok(slot.get().expect("value was just set"))
     }
 
     /// Returns `true` if a value of type `T` has been set.
@@ -260,16 +299,15 @@ impl OnceTypeMap {
     /// assert_eq!(map.get::<Vec<i32>>(), Some(&vec![1, 2, 3]));
     /// ```
     pub fn get_mut<T: Send + Sync + 'static>(&mut self) -> Option<&mut T> {
-        self.slots_mut()
-            .get_mut(&TypeId::of::<T>())?
-            .as_any_mut()
-            .downcast_mut::<OnceLock<T>>()?
-            .get_mut()
+        let slot = self.slots_mut().get_mut(&TypeId::of::<T>())?;
+        downcast_slot_mut::<T>(&mut **slot).get_mut()
     }
 
     /// Removes the value of type `T` and returns it, if set.
     ///
-    /// After removal, the type can be set again.
+    /// After removal, the type can be set again. This also frees the empty
+    /// slot left behind by an initializer that panicked; in that case it
+    /// returns `None`.
     ///
     /// # Examples
     ///
@@ -284,10 +322,10 @@ impl OnceTypeMap {
     /// ```
     pub fn remove<T: Send + Sync + 'static>(&mut self) -> Option<T> {
         let slot = self.slots_mut().remove(&TypeId::of::<T>())?;
-        slot.into_any().downcast::<OnceLock<T>>().ok()?.into_inner()
+        downcast_slot_box::<T>(slot).into_inner()
     }
 
-    /// Removes all values.
+    /// Removes all values, and frees all slots, including empty ones.
     pub fn clear(&mut self) {
         self.slots_mut().clear();
     }
@@ -295,7 +333,9 @@ impl OnceTypeMap {
     /// Returns the number of types whose value is set.
     ///
     /// Types whose initializer is still running, or panicked, are not
-    /// counted. This walks all slots, so it is `O(n)` in the number of types.
+    /// counted. This walks all slots, so it is `O(n)` in the number of types
+    /// ever used, including types whose slot was left empty by a panicking
+    /// initializer (see [Empty slots](crate#empty-slots)).
     ///
     /// # Examples
     ///
@@ -312,6 +352,9 @@ impl OnceTypeMap {
     }
 
     /// Returns `true` if no value is set.
+    ///
+    /// Like [`len`](Self::len), this may scan every slot, including empty
+    /// ones.
     pub fn is_empty(&self) -> bool {
         !self.read().values().any(|slot| slot.is_set())
     }
@@ -372,10 +415,22 @@ impl fmt::Debug for OnceTypeMap {
     }
 }
 
+// Every slot is inserted under the `TypeId` of its own `T`, so these
+// downcasts cannot fail. If that invariant is ever broken, all access paths
+// panic the same way rather than some of them reporting a missing value (and
+// `remove` silently dropping it).
+const SLOT_TYPE_MISMATCH: &str = "slot type always matches its TypeId key";
+
 fn downcast_slot<T: Send + Sync + 'static>(slot: &dyn Slot) -> &OnceLock<T> {
-    slot.as_any()
-        .downcast_ref()
-        .expect("slot type always matches its TypeId key")
+    slot.as_any().downcast_ref().expect(SLOT_TYPE_MISMATCH)
+}
+
+fn downcast_slot_mut<T: Send + Sync + 'static>(slot: &mut dyn Slot) -> &mut OnceLock<T> {
+    slot.as_any_mut().downcast_mut().expect(SLOT_TYPE_MISMATCH)
+}
+
+fn downcast_slot_box<T: Send + Sync + 'static>(slot: Box<dyn Slot>) -> Box<OnceLock<T>> {
+    slot.into_any().downcast().expect(SLOT_TYPE_MISMATCH)
 }
 
 /// Type-erased `OnceLock<T>`.
@@ -516,6 +571,28 @@ mod tests {
             map.get_or_init::<u8>(|| panic!("init failed"));
         }));
         assert_eq!(map.insert(5u8), Ok(&5));
+    }
+
+    #[test]
+    fn remove_and_clear_free_empty_slots() {
+        let mut map = OnceTypeMap::new();
+        for _ in 0..2 {
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                map.get_or_init::<i32>(|| panic!("init failed"));
+            }));
+        }
+        let _ = catch_unwind(AssertUnwindSafe(|| {
+            map.get_or_init::<u8>(|| panic!("init failed"));
+        }));
+        // Retrying reuses the slot instead of adding another one.
+        assert_eq!(map.slots_mut().len(), 2);
+        assert!(map.is_empty());
+
+        assert_eq!(map.remove::<i32>(), None);
+        assert_eq!(map.slots_mut().len(), 1);
+
+        map.clear();
+        assert_eq!(map.slots_mut().len(), 0);
     }
 
     #[test]
