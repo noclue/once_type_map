@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # Weekly run, so a new nightly Miri that finds something is noticed even
+  # when the code hasn't changed.
+  schedule:
+    - cron: "0 6 * * 1"
+
+# `pull_request` (not `pull_request_target`) runs fork PRs with a read-only
+# token and no secrets, so it is safe to run on untrusted code.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Every job checks `github.server_url`: Gitea and Forgejo can also pick up
+# `.github/workflows`, and there these jobs would wait forever for an
+# `ubuntu-latest` runner. On those servers they are skipped instead.
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    if: github.server_url == 'https://github.com'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --all-targets
+      - run: cargo test --locked --doc
+      - name: Run examples
+        shell: bash
+        run: |
+          for example in examples/*.rs; do
+            cargo run --locked --example "$(basename "$example" .rs)"
+          done
+
+  msrv:
+    name: test (Rust 1.86)
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Keep in sync with `rust-version` in Cargo.toml.
+      - uses: dtolnay/rust-toolchain@1.86
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --all-targets
+      - run: cargo test --locked --doc
+
+  lint:
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo doc --locked --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # Miri checks the `unsafe` code for undefined behavior under both aliasing
+  # models. The examples are left out: they only use the safe API.
+  miri:
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: cargo miri setup
+      - name: Stacked Borrows
+        run: cargo miri test --locked
+      - name: Tree Borrows
+        run: cargo miri test --locked
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows
+      - name: Concurrency tests, many thread schedules
+        run: cargo miri test --locked --lib concurrent
+        env:
+          MIRIFLAGS: -Zmiri-many-seeds=0..16
