@@ -30,6 +30,24 @@ fn cache(client: &Client) -> &MyCache {
 }
 ```
 
+[`examples/extensions.rs`](examples/extensions.rs) shows the full pattern. A
+library defines the extensible `Client`, and two independent extension modules
+add methods to it through extension traits. The application imports those
+traits and uses them, including from several threads:
+
+```sh
+cargo run --example extensions
+```
+
+[`examples/async_extensions.rs`](examples/async_extensions.rs) shows the
+same idea when the extension's state has to be created asynchronously, for
+example by a login call. It stores a `tokio::sync::OnceCell` in the map, so
+concurrent tasks wait for a single login without blocking the executor:
+
+```sh
+cargo run --example async_extensions
+```
+
 ## Why references instead of guards?
 
 Typical type maps (`http::Extensions`, `anymap`, `RwLock<HashMap<TypeId, Box<dyn Any>>>`)
@@ -101,11 +119,46 @@ and `clear()` free empty slots too.
 - One value per type. Use newtypes to store several values of the same
   underlying type.
 - Values must be `Send + Sync + 'static`.
-- Initializers are synchronous and can't fail. If you need fallible or async
-  initialization, store a `OnceLock`-like cell of your own (for example
-  `tokio::sync::OnceCell`) as the value.
+- Initializers are synchronous and can't fail. See the next section.
 - A lookup takes a shared read lock. Because the returned reference isn't tied
   to a guard, hot paths can look a value up once and keep the `&T`.
+- The minimum supported Rust version is 1.86.
+
+## Fallible and async initialization
+
+std's `OnceLock::get_or_try_init` isn't stable yet, so the map has no
+`get_or_try_init`. What to store instead depends on what a failure means:
+
+- **The failure is final** (a malformed setting, say). Store the `Result`
+  itself with `get_or_init`. Every caller sees the same outcome, and setup
+  runs once.
+- **The failure is temporary** (a server that isn't up yet). Store a cell
+  that supports a fallible initializer, such as `once_cell::sync::OnceCell`:
+
+  ```rust
+  map.get_or_init(|| DbCell(OnceCell::new()))
+      .0
+      .get_or_try_init(|| connect())
+  ```
+
+  A failed attempt stores nothing, so the next call tries again, and only one
+  attempt runs at a time.
+- **Setup is async.** Store an async cell such as `tokio::sync::OnceCell`. The
+  map only creates the empty cell, and the cell's async `get_or_init` (or
+  `get_or_try_init`, if setup can also fail) does the work without blocking the
+  executor. Don't run slow or blocking setup in the
+  map's own `get_or_init` from async code, because callers waiting on it block
+  their thread.
+
+[`examples/fallible_extensions.rs`](examples/fallible_extensions.rs) shows the
+first two cases side by side:
+
+```sh
+cargo run --example fallible_extensions
+```
+
+Once std stabilizes `OnceLock::get_or_try_init`, the map will gain a matching
+method.
 
 ## Checking the unsafe code
 

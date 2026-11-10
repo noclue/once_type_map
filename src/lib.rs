@@ -154,10 +154,41 @@
 //!
 //! - One value per type. Use newtypes to store several values of the same
 //!   underlying type.
-//! - Initializers are synchronous and can't fail. For fallible or async
-//!   initialization, store a cell of your own as the value, for example
-//!   `tokio::sync::OnceCell<T>`, or `OnceLock<Result<T, E>>` if a failure
-//!   should be cached.
+//! - Initializers are synchronous and can't fail. See below for how to handle
+//!   setup that can fail or is async.
+//!
+//! # Fallible and async initialization
+//!
+//! std's `OnceLock::get_or_try_init` is not stable yet, so the map has no
+//! `get_or_try_init`. What to store instead depends on what a failure means:
+//!
+//! - **The failure is final.** Store the `Result` itself. Every caller sees
+//!   the same outcome, and setup runs once:
+//!
+//!   ```rust
+//!   # use once_type_map::OnceTypeMap;
+//!   # let map = OnceTypeMap::new();
+//!   struct Port(Result<u16, std::num::ParseIntError>);
+//!
+//!   let port = &map.get_or_init(|| Port("80a".parse())).0;
+//!   assert!(port.is_err());
+//!   ```
+//!
+//! - **The failure is temporary.** Store a cell that supports a fallible
+//!   initializer, such as `once_cell::sync::OnceCell`, and call its
+//!   `get_or_try_init`. A failed attempt stores nothing, so the next call
+//!   tries again, and only one attempt runs at a time.
+//!
+//! - **Setup is async.** Store an async cell, such as
+//!   `tokio::sync::OnceCell`. The map's `get_or_init` only creates the empty
+//!   cell, and the cell's async `get_or_init` (or `get_or_try_init`) does the
+//!   work without blocking the executor. Don't run slow or blocking setup in
+//!   the map's own `get_or_init` from async code: callers that wait on it
+//!   block their thread.
+//!
+//! The `fallible_extensions` and `async_extensions` examples in the
+//! repository show these patterns. Once std stabilizes
+//! `OnceLock::get_or_try_init`, the map will gain a matching method.
 //!
 //! # Cost
 //!
@@ -442,41 +473,32 @@ impl fmt::Debug for OnceTypeMap {
 // `remove` silently dropping it).
 const SLOT_TYPE_MISMATCH: &str = "slot type always matches its TypeId key";
 
+// Each helper upcasts `dyn Slot` to `dyn Any` (trait upcasting, Rust 1.86)
+// and then downcasts to the concrete slot type.
+
 fn downcast_slot<T: Send + Sync + 'static>(slot: &dyn Slot) -> &OnceLock<T> {
-    slot.as_any().downcast_ref().expect(SLOT_TYPE_MISMATCH)
+    let slot: &dyn Any = slot;
+    slot.downcast_ref().expect(SLOT_TYPE_MISMATCH)
 }
 
 fn downcast_slot_mut<T: Send + Sync + 'static>(slot: &mut dyn Slot) -> &mut OnceLock<T> {
-    slot.as_any_mut().downcast_mut().expect(SLOT_TYPE_MISMATCH)
+    let slot: &mut dyn Any = slot;
+    slot.downcast_mut().expect(SLOT_TYPE_MISMATCH)
 }
 
 fn downcast_slot_box<T: Send + Sync + 'static>(slot: Box<dyn Slot>) -> Box<OnceLock<T>> {
-    slot.into_any().downcast().expect(SLOT_TYPE_MISMATCH)
+    let slot: Box<dyn Any> = slot;
+    slot.downcast().expect(SLOT_TYPE_MISMATCH)
 }
 
 /// Type-erased `OnceLock<T>`.
-trait Slot: Send + Sync {
+trait Slot: Any + Send + Sync {
     fn is_set(&self) -> bool;
-    fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
-    fn into_any(self: Box<Self>) -> Box<dyn Any>;
 }
 
 impl<T: Send + Sync + 'static> Slot for OnceLock<T> {
     fn is_set(&self) -> bool {
         self.get().is_some()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn Any> {
-        self
     }
 }
 
@@ -508,7 +530,7 @@ impl Hasher for TypeIdHasher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::thread;
