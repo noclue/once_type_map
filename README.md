@@ -59,6 +59,10 @@ is sound because of three rules:
 
 1. Each type's value lives in its own heap-allocated `OnceLock<T>` slot. When
    the internal hash map grows, it moves the pointer to the slot, not the slot.
+   That pointer is an `Arc` that is never cloned, rather than a `Box`, because
+   whether moving a `Box` invalidates references into it is still open in
+   Rust's aliasing rules. An `Arc` makes no uniqueness claim about what it
+   points to.
 2. Through `&self`, a slot can only be created and filled once.
 3. Slots are only mutated, removed or dropped through `&mut self` or by
    dropping the map. The borrow checker allows that only when no `&T` handed
@@ -167,8 +171,10 @@ slot reference from the lock guard's lifetime to the borrow of the map. There
 are three `unsafe` blocks: the one in the body of `detach`, and one at each of
 its two call sites (`slot` and `create_slot`). Each call site has to meet
 `detach`'s precondition: the slot must be owned by the map. Any new call to
-`detach` needs the same review. The test suite includes a test that keeps a
-reference alive while the map grows. Run it under
+`detach` needs the same review.
+
+The tests keep a reference alive while the map grows, and while every slot is
+moved through ordinary typed code. Run them under
 [Miri](https://github.com/rust-lang/miri) with both aliasing models:
 
 ```sh

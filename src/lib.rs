@@ -40,6 +40,13 @@
 //! but that moves only the pointer to a slot, not the slot itself. A `&T`
 //! therefore stays valid for as long as the map is borrowed.
 //!
+//! The map owns each slot through an [`Arc`] that is never cloned, rather
+//! than a `Box`. Whether moving a `Box` invalidates references into its
+//! contents is still an open question in Rust's aliasing rules, and the map
+//! moves its slot pointers while such references are alive. An `Arc` holds a
+//! plain pointer with no uniqueness claim, so moving it is just copying an
+//! address, and the argument above doesn't depend on how that is settled.
+//!
 //! Mutating or removing values requires `&mut self` ([`get_mut`], [`remove`],
 //! [`clear`]). The borrow checker allows that only when no `&T` handed out by
 //! the map is alive — the same reasoning that lets [`OnceLock::get_mut`] and
@@ -210,10 +217,13 @@ use std::{
     collections::HashMap,
     fmt,
     hash::{BuildHasherDefault, Hasher},
-    sync::{OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
+    sync::{Arc, OnceLock, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard},
 };
 
-type Slots = HashMap<TypeId, Box<dyn Slot>, BuildHasherDefault<TypeIdHasher>>;
+// Slots are owned through `Arc` instead of `Box` only to avoid `Box`'s
+// aliasing rules (see the crate docs). The `Arc`s are never cloned, so each
+// one is the sole owner of its slot.
+type Slots = HashMap<TypeId, Arc<dyn Slot>, BuildHasherDefault<TypeIdHasher>>;
 
 /// A thread-safe map holding at most one value per type, set once through
 /// `&self` and read through plain references.
@@ -340,7 +350,8 @@ impl OnceTypeMap {
     /// ```
     pub fn get_mut<T: Send + Sync + 'static>(&mut self) -> Option<&mut T> {
         let slot = self.slots_mut().get_mut(&TypeId::of::<T>())?;
-        downcast_slot_mut::<T>(&mut **slot).get_mut()
+        let slot = Arc::get_mut(slot).expect(SLOT_NEVER_SHARED);
+        downcast_slot_mut::<T>(slot).get_mut()
     }
 
     /// Removes the value of type `T` and returns it, if set.
@@ -362,7 +373,8 @@ impl OnceTypeMap {
     /// ```
     pub fn remove<T: Send + Sync + 'static>(&mut self) -> Option<T> {
         let slot = self.slots_mut().remove(&TypeId::of::<T>())?;
-        downcast_slot_box::<T>(slot).into_inner()
+        let slot = downcast_slot_arc::<T>(slot);
+        Arc::into_inner(slot).expect(SLOT_NEVER_SHARED).into_inner()
     }
 
     /// Removes all values, and frees all slots, including empty ones.
@@ -417,15 +429,13 @@ impl OnceTypeMap {
     /// Another thread may have created the slot after our read-locked
     /// lookup missed, so the entry may already be occupied, and that slot's
     /// value may be borrowed. `or_insert_with` then hands out a `&mut` to the
-    /// `Box` pointer stored in the map, but not to the `OnceLock` it points
+    /// `Arc` stored in the map, but not to the `OnceLock` it points
     /// to, so outstanding `&T`s stay valid. The
     /// `create_slot_on_occupied_entry_keeps_references_valid` test checks
     /// this under Miri.
     fn create_slot<T: Send + Sync + 'static>(&self) -> &OnceLock<T> {
         let mut slots = self.write();
-        let slot = slots
-            .entry(TypeId::of::<T>())
-            .or_insert_with(|| Box::new(OnceLock::<T>::new()));
+        let slot = slots.entry(TypeId::of::<T>()).or_insert_with(new_slot::<T>);
         let slot = downcast_slot::<T>(&**slot);
         // SAFETY: `slot` is owned by `self.slots`.
         unsafe { self.detach(slot) }
@@ -437,9 +447,10 @@ impl OnceTypeMap {
     /// # Safety
     ///
     /// `slot` must point into a slot owned by `self.slots`. This is sound
-    /// because slots are boxed, so rehashing never moves them, and slots are
-    /// only removed or replaced through `&mut self`, which cannot coexist with
-    /// the `&'a self` borrow the result is tied to.
+    /// because each slot has its own allocation owned by an `Arc`, so
+    /// rehashing moves only the `Arc`, never the slot, and slots are only
+    /// removed or replaced through `&mut self`, which cannot coexist with the
+    /// `&'a self` borrow the result is tied to.
     unsafe fn detach<'a, T>(&'a self, slot: &OnceLock<T>) -> &'a OnceLock<T> {
         unsafe { &*(slot as *const OnceLock<T>) }
     }
@@ -472,6 +483,11 @@ impl fmt::Debug for OnceTypeMap {
 // panic the same way rather than some of them reporting a missing value (and
 // `remove` silently dropping it).
 const SLOT_TYPE_MISMATCH: &str = "slot type always matches its TypeId key";
+const SLOT_NEVER_SHARED: &str = "slot Arcs are never cloned";
+
+fn new_slot<T: Send + Sync + 'static>() -> Arc<dyn Slot> {
+    Arc::new(OnceLock::<T>::new())
+}
 
 // Each helper upcasts `dyn Slot` to `dyn Any` (trait upcasting, Rust 1.86)
 // and then downcasts to the concrete slot type.
@@ -486,8 +502,8 @@ fn downcast_slot_mut<T: Send + Sync + 'static>(slot: &mut dyn Slot) -> &mut Once
     slot.downcast_mut().expect(SLOT_TYPE_MISMATCH)
 }
 
-fn downcast_slot_box<T: Send + Sync + 'static>(slot: Box<dyn Slot>) -> Box<OnceLock<T>> {
-    let slot: Box<dyn Any> = slot;
+fn downcast_slot_arc<T: Send + Sync + 'static>(slot: Arc<dyn Slot>) -> Arc<OnceLock<T>> {
+    let slot: Arc<dyn Any + Send + Sync> = slot;
     slot.downcast().expect(SLOT_TYPE_MISMATCH)
 }
 
@@ -688,6 +704,34 @@ mod tests {
 
         map.create_slot::<String>().get_or_init(|| unreachable!());
         assert_eq!(held, "held");
+    }
+
+    /// `std` doesn't promise how `HashMap` moves its values when it resizes.
+    /// Today it copies the raw bytes, but it could as well move each value
+    /// through typed code. This test does that on purpose, passing every slot
+    /// by value through a function while a `&T` is held, and checks under
+    /// Miri that the reference stays valid.
+    #[test]
+    fn references_survive_typed_moves_of_slots() {
+        #[inline(never)]
+        fn pass_through<S>(slot: S) -> S {
+            slot
+        }
+
+        let map = OnceTypeMap::new();
+        let held: &String = map.get_or_init(|| "held".to_string());
+        map.get_or_init(|| 1u8);
+
+        {
+            let mut slots = map.write();
+            let moved: Vec<_> = slots.drain().collect();
+            for (id, slot) in moved {
+                slots.insert(id, pass_through(slot));
+            }
+        }
+
+        assert_eq!(held, "held");
+        assert!(std::ptr::eq(map.get::<String>().unwrap(), held));
     }
 
     #[test]
